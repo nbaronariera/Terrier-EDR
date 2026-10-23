@@ -1,0 +1,18 @@
+[package]
+name = "spark-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+commons = { path = "../commons" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "spark"
+path = "src/main.rs"
+
