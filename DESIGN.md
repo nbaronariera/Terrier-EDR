@@ -1,9 +1,9 @@
 # Terrier — Documento de diseño
 
 > **Nota de transparencia (AGENTS.md §2):** este documento ha sido redactado
-> por IA (Claude) a partir de las notas y decisiones del autor. Las decisiones
-> de diseño son del autor; la redacción, las tablas de formato y dominio
-> (extraídas del código de `commons`) y la sección final *Pendiente* son
+> con apoyo de IA a partir de las notas y decisiones del diseñador.
+> Las tablas de formato y dominio (extraídas del código de `commons`)
+> y la sección final *Pendiente* son
 > generadas por IA. Estado a 2026-10-19.
 
 ---
@@ -229,10 +229,7 @@ Responsabilidades de Swivel:
 
 ## Pendiente por definir
 
-*(Lista generada por IA: huecos o contradicciones que hay que resolver en el
-documento o en el código.)*
-
-**Implementación** (recuperado de `next.txt`; orden recomendado: los tres primeros, en orden)
+**Implementación**
 - [ ] Implementar `assemble_net` (hoy es un stub `Ok(())`). Escribir IP y
       puerto en big-endian (`.to_be()`). Definir `direction`, `result` y `protocol`.
 - [ ] Test de ida y vuelta con el productor real: `EventBuilder → parse_event →
