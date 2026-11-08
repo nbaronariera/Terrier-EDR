@@ -1,27 +1,44 @@
 use alloc::string::String;
 
-use strum_macros::FromRepr;
-
-use crate::{
-    event_wire::{FileOperation, RawEvent, RawEventPayload},
-    events::NetProtocol::Unregistered,
+use super::{FileEvent, NetEvent, ProcessEvent};
+use crate::events::{
+    domain::{
+        FileOperation, NetAddress,
+        NetOperation::{self},
+        NetProtocol::{self},
+        NetResult,
+    },
+    wire::{RawEvent, RawEventPayload},
 };
 
+/// Evento ya validado y listo para consumir en espacio de usuario.
+///
+/// Combina los datos comunes a todo evento ([`EventCommon`]) con los
+/// específicos de su tipo ([`EventType`]). Se obtiene con [`Event::from_raw`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     pub common: EventCommon,
     pub event_type: EventType,
 }
 
+/// Errores al convertir un [`RawEvent`] en un [`Event`].
+///
+/// Cubre la ausencia o corrupción de la ruta (tail) y los valores numéricos
+/// de operación/dirección que no corresponden a ninguna variante conocida.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum EventError {
     MissingRoute,
     InvalidRouteUtf8,
     InvalidFileOperation(u8),
-    InvalidNetDirection(u8),
 }
 
 impl Event {
+    /// Convierte un evento crudo del ring buffer en un [`Event`] tipado.
+    ///
+    /// Copia la cabecera común, extrae la ruta del tail (quitando el `\0`
+    /// final si lo hay), convierte las IPs de orden de red a tipos de dominio
+    /// (los puertos ya llegan en orden del host) y traduce los códigos
+    /// numéricos a enums. Devuelve [`EventError`] si algo no cuadra.
     pub fn from_raw(value: RawEvent<'_>) -> Result<Self, EventError> {
         let common = EventCommon {
             pid: value.header.pid,
@@ -57,29 +74,29 @@ impl Event {
                     .ok_or(EventError::InvalidFileOperation(raw.operation))?,
             }),
 
-            RawEventPayload::Net(raw) => EventType::Net(NetEvent {
-                origin: NetAddress {
-                    ip: u32::from_be(raw.origin_ip),
-                    port: u16::from_be(raw.origin_port),
-                },
-                target: NetAddress {
-                    ip: u32::from_be(raw.target_ip),
-                    port: u16::from_be(raw.target_port),
-                },
-                protocol: NetProtocol::from_repr(raw.protocol)
-                    .unwrap_or(Unregistered(raw.protocol)),
+            RawEventPayload::NetIPv4(raw) => EventType::Net(NetEvent {
+                origin: Some(NetAddress::new_ipv4(raw.origin_ip, raw.origin_port)),
+                target: Some(NetAddress::new_ipv4(raw.target_ip, raw.target_port)),
+                protocol: NetProtocol::from_u8(raw.protocol),
                 result: NetResult::from_u8(raw.result),
-                direction: match raw.direction {
-                    0 => NetDirection::Inbound,
-                    1 => NetDirection::Outbound,
-                    _ => return Err(EventError::InvalidNetDirection(raw.direction)),
-                },
+                operation: NetOperation::from_u8(raw.operation),
+            }),
+            RawEventPayload::NetIPv6(raw) => EventType::Net(NetEvent {
+                origin: Some(NetAddress::new_ipv6_bytes(raw.origin_ip, raw.origin_port)),
+                target: Some(NetAddress::new_ipv6_bytes(raw.target_ip, raw.target_port)),
+                protocol: NetProtocol::from_u8(raw.protocol),
+                result: NetResult::from_u8(raw.result),
+                operation: NetOperation::from_u8(raw.operation),
             }),
         };
 
         Ok(Event { common, event_type })
     }
 }
+/// Parte específica de un [`Event`] según su categoría.
+///
+/// Cada variante envuelve el struct con los campos propios de ese tipo de
+/// evento: ejecución de procesos, acceso a ficheros o actividad de red.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventType {
     Process(ProcessEvent),
@@ -87,6 +104,10 @@ pub enum EventType {
     Net(NetEvent),
 }
 
+/// Datos compartidos por todos los eventos.
+///
+/// PID y UID del proceso que lo generó, el timestamp del kernel en el que
+/// se capturó y el identificador del host (de momento siempre `0`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventCommon {
     pub pid: u32,
@@ -95,72 +116,18 @@ pub struct EventCommon {
     pub host: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessEvent {
-    pub process: u32,
-    pub ancestor: u32,
-    pub inode: u64,
-    pub route: String,
-    //args: u32, TODO
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileEvent {
-    pub route: String,
-    pub inode: u64,
-    pub operation: FileOperation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NetEvent {
-    pub origin: NetAddress,
-    pub target: NetAddress,
-    pub protocol: NetProtocol,
-    pub result: NetResult,
-    pub direction: NetDirection,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NetAddress {
-    pub ip: u32,
-    pub port: u16,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum NetDirection {
-    Inbound,
-    Outbound,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum NetResult {
-    Success,
-    Failed(u8),
-}
-
-impl NetResult {
-    fn from_u8(val: u8) -> Self {
-        match val {
-            0 => Self::Success,
-            err_code => Self::Failed(err_code),
-        }
-    }
-}
-#[derive(Debug, PartialEq, Eq, FromRepr, Clone, Copy)]
-#[repr(u8)]
-pub enum NetProtocol {
-    ICMP = 1,
-    TCP = 6,
-    UDP = 17,
-    Unregistered(u8),
-}
-
+// NOTA: tests generados/asistidos por IA (Claude), regla 2 de CLAUDE.md.
 #[cfg(test)]
 mod tests {
+    use core::net::Ipv4Addr;
+
     use super::*;
-    use crate::event_wire::{
-        EventKind, FileOperation, RawEvent, RawEventHeader, RawEventPayload, RawFilePayload,
-        RawNetPayload, RawProcessPayload,
+    use crate::events::{
+        domain::NetAddressProtocol,
+        wire::{
+            EventKind, RawEvent, RawEventHeader, RawEventPayload, RawFilePayload,
+            RawNetIPv4Payload, RawProcessPayload,
+        },
     };
 
     fn header(kind: EventKind) -> RawEventHeader {
@@ -203,18 +170,18 @@ mod tests {
         target_port: u16,
         protocol: u8,
         result: u8,
-        direction: u8,
+        operation: u8,
     ) -> RawEvent<'static> {
         RawEvent {
-            header: header(EventKind::Net),
-            payload: RawEventPayload::Net(RawNetPayload {
+            header: header(EventKind::NetIPv4),
+            payload: RawEventPayload::NetIPv4(RawNetIPv4Payload {
                 origin_ip,
                 target_ip,
                 origin_port,
                 target_port,
                 protocol,
+                operation,
                 result,
-                direction,
             }),
             tail: None,
         }
@@ -294,29 +261,62 @@ mod tests {
         );
     }
 
+    // IPs en orden de red y puertos ya en orden del host, como los escribe eBPF.
     #[test]
-    fn net_decodes_big_endian_addresses_and_maps_fields() {
+    fn net_decodes_big_endian_ips_and_host_order_ports() {
         let event = Event::from_raw(raw_net(
             0xC0A80001u32.to_be(),
             0x08080808u32.to_be(),
-            443u16.to_be(),
-            54321u16.to_be(),
+            443,
+            54321,
             6,
             0,
-            0,
+            NetOperation::Connect.to_u8(),
         ))
         .unwrap();
 
         match &event.event_type {
             EventType::Net(n) => {
-                assert_eq!(n.origin.ip, 0xC0A80001);
-                assert_eq!(n.origin.port, 443);
-                assert_eq!(n.target.ip, 0x08080808);
-                assert_eq!(n.target.port, 54321);
+                assert_eq!(
+                    n.origin,
+                    Some(NetAddress {
+                        ip: NetAddressProtocol::IPv4(Ipv4Addr::new(192, 168, 0, 1)),
+                        port: 443
+                    })
+                );
+                assert_eq!(
+                    n.target,
+                    Some(NetAddress {
+                        ip: NetAddressProtocol::IPv4(Ipv4Addr::new(8, 8, 8, 8)),
+                        port: 54321
+                    })
+                );
                 assert_eq!(n.protocol, NetProtocol::TCP);
                 assert_eq!(n.result, NetResult::Success);
-                assert_eq!(n.direction, NetDirection::Inbound);
+                assert_eq!(n.operation, NetOperation::Connect);
             }
+            other => panic!("esperaba Net, obtuvo {:?}", other),
+        }
+    }
+
+    // Un valor con bytes distintos detecta cualquier intercambio de bytes de más.
+    #[test]
+    fn net_port_is_not_byte_swapped() {
+        let event = Event::from_raw(raw_net(0, 0, 0x1234, 0xABCD, 6, 0, 0)).unwrap();
+        match &event.event_type {
+            EventType::Net(n) => {
+                assert_eq!(n.origin.as_ref().unwrap().port, 0x1234);
+                assert_eq!(n.target.as_ref().unwrap().port, 0xABCD);
+            }
+            other => panic!("esperaba Net, obtuvo {:?}", other),
+        }
+    }
+
+    #[test]
+    fn net_maps_bind_operation() {
+        let event = Event::from_raw(raw_net(0, 0, 0, 0, 6, 0, NetOperation::Bind.to_u8())).unwrap();
+        match &event.event_type {
+            EventType::Net(n) => assert_eq!(n.operation, NetOperation::Bind),
             other => panic!("esperaba Net, obtuvo {:?}", other),
         }
     }
@@ -325,27 +325,27 @@ mod tests {
     fn net_unknown_protocol_is_unregistered() {
         let event = Event::from_raw(raw_net(0, 0, 0, 0, 47, 0, 0)).unwrap();
         match &event.event_type {
-            EventType::Net(n) => assert_eq!(n.protocol, NetProtocol::Unregistered(47)),
+            EventType::Net(n) => assert_eq!(n.protocol, NetProtocol::UndefinedProtocol(47)),
             other => panic!("esperaba Net, obtuvo {:?}", other),
         }
     }
 
     #[test]
-    fn net_invalid_direction_is_error() {
-        assert_eq!(
-            Event::from_raw(raw_net(0, 0, 0, 0, 6, 0, 2)).unwrap_err(),
-            EventError::InvalidNetDirection(2)
-        );
+    fn net_unknown_operation_keeps_raw_value() {
+        let event = Event::from_raw(raw_net(0, 0, 0, 0, 6, 0, 200)).unwrap();
+        match &event.event_type {
+            EventType::Net(n) => assert_eq!(n.operation, NetOperation::UndefinedOperation(200)),
+            other => panic!("esperaba Net, obtuvo {:?}", other),
+        }
     }
 
     #[test]
-    fn net_outbound_and_failed_result() {
-        let event = Event::from_raw(raw_net(0, 0, 0, 0, 17, 5, 1)).unwrap();
+    fn net_failed_result_keeps_error_code() {
+        let event = Event::from_raw(raw_net(0, 0, 0, 0, 17, 5, 0)).unwrap();
         match &event.event_type {
             EventType::Net(n) => {
                 assert_eq!(n.protocol, NetProtocol::UDP);
                 assert_eq!(n.result, NetResult::Failed(5));
-                assert_eq!(n.direction, NetDirection::Outbound);
             }
             other => panic!("esperaba Net, obtuvo {:?}", other),
         }

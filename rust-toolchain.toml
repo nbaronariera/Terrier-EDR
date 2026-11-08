@@ -1,0 +1,14 @@
+# Generado con asistencia de IA (Claude Code).
+#
+# Nightly fijado al último con LLVM 22 (rustc 1.99.0-nightly 2026-08-05, LLVM 22.1.8).
+# A partir del nightly 2026-08-06 rustc usa LLVM 23, y el bpf-linker 0.10.4
+# (enlazado contra LLVM 22) no entiende su bitcode: "ERROR llvm: Invalid record".
+# Antes de subir esta fecha, comprueba que coinciden:
+#   rustc -vV | grep LLVM
+#   ldd "$(which bpf-linker)" | grep LLVM
+#
+# En NixOS (sin rustup) este fichero NO se lee: la misma fecha está fijada en
+# ~/NixOs-Conf/nixosModules/programacion/rust.nix. Mantener ambas sincronizadas.
+[toolchain]
+channel = "nightly-2026-08-05"
+components = ["rust-src", "rust-analyzer"]

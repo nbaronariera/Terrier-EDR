@@ -1,20 +1,23 @@
 //! Tests de integración del pipeline completo: bytes crudos -> parse_event -> Event::from_raw.
 //!
 //! Verifican los valores decodificados (no solo Ok/Err). Requieren el feature `user`
-//! porque el módulo `events` está gateado tras `#[cfg(feature = "user")]`.
+//! porque el módulo `events::user_space` está gateado tras `#[cfg(feature = "user")]`.
 //!
 //! Ejecutar con: `cargo test -p commons --features user`.
 //!
-//! Generados/asistidos por IA (AGENTS.md, regla 2).
+//! Generados/asistidos por IA (CLAUDE.md, regla 2).
 
-use core::mem::size_of;
+use core::{mem::size_of, net::Ipv4Addr};
 
-use commons::{
-    event_wire::{
-        parse_event, EventKind, FileOperation, RawEventHeader, RawFilePayload, RawNetPayload,
-        RawProcessPayload,
+use commons::events::{
+    domain::{
+        FileOperation, NetAddress, NetAddressProtocol, NetOperation, NetProtocol, NetResult,
     },
-    events::{Event, EventError, EventType, NetDirection, NetProtocol, NetResult},
+    user_space::{Event, EventError, EventType},
+    wire::{
+        EventKind, RawEventHeader, RawFilePayload, RawNetIPv4Payload, RawProcessPayload,
+        parse_event,
+    },
 };
 
 fn to_bytes<T: Copy>(value: &T) -> Vec<u8> {
@@ -76,18 +79,19 @@ fn process_event_decodes_header_payload_and_route() {
     }
 }
 
+// IPs en orden de red y puertos ya en orden del host, como los escribe eBPF.
 #[test]
-fn net_event_decodes_big_endian_addresses() {
+fn net_event_decodes_big_endian_ips_and_host_order_ports() {
     let bytes = build_event(
-        EventKind::Net as u8,
-        &RawNetPayload {
+        EventKind::NetIPv4 as u8,
+        &RawNetIPv4Payload {
             origin_ip: 0xC0A80001u32.to_be(),
             target_ip: 0x08080808u32.to_be(),
-            origin_port: 443u16.to_be(),
-            target_port: 54321u16.to_be(),
+            origin_port: 443,
+            target_port: 54321,
             protocol: 6,
+            operation: NetOperation::Connect.to_u8(),
             result: 0,
-            direction: 0,
         },
         None,
     );
@@ -97,13 +101,23 @@ fn net_event_decodes_big_endian_addresses() {
 
     match &event.event_type {
         EventType::Net(n) => {
-            assert_eq!(n.origin.ip, 0xC0A80001);
-            assert_eq!(n.origin.port, 443);
-            assert_eq!(n.target.ip, 0x08080808);
-            assert_eq!(n.target.port, 54321);
+            assert_eq!(
+                n.origin,
+                Some(NetAddress {
+                    ip: NetAddressProtocol::IPv4(Ipv4Addr::new(192, 168, 0, 1)),
+                    port: 443
+                })
+            );
+            assert_eq!(
+                n.target,
+                Some(NetAddress {
+                    ip: NetAddressProtocol::IPv4(Ipv4Addr::new(8, 8, 8, 8)),
+                    port: 54321
+                })
+            );
             assert_eq!(n.protocol, NetProtocol::TCP);
             assert_eq!(n.result, NetResult::Success);
-            assert_eq!(n.direction, NetDirection::Inbound);
+            assert_eq!(n.operation, NetOperation::Connect);
         }
         other => panic!("esperaba Net, obtuvo {:?}", other),
     }
@@ -188,24 +202,25 @@ fn file_event_unknown_operation_reports_error() {
 }
 
 #[test]
-fn net_event_invalid_direction_reports_error() {
+fn net_event_unknown_operation_keeps_raw_value() {
     let bytes = build_event(
-        EventKind::Net as u8,
-        &RawNetPayload {
+        EventKind::NetIPv4 as u8,
+        &RawNetIPv4Payload {
             origin_ip: 0,
             target_ip: 0,
             origin_port: 0,
             target_port: 0,
             protocol: 6,
+            operation: 200,
             result: 0,
-            direction: 2,
         },
         None,
     );
 
     let raw = parse_event(&bytes).expect("parse_event falla");
-    assert_eq!(
-        Event::from_raw(raw).unwrap_err(),
-        EventError::InvalidNetDirection(2)
-    );
+    let event = Event::from_raw(raw).expect("from_raw falla");
+    match &event.event_type {
+        EventType::Net(n) => assert_eq!(n.operation, NetOperation::UndefinedOperation(200)),
+        other => panic!("esperaba Net, obtuvo {:?}", other),
+    }
 }

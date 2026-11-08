@@ -1,8 +1,15 @@
 use aya::{Ebpf, EbpfError};
-use commons::{event_wire::parse_event, events::Event};
+use commons::events::{user_space::Event, wire::parse_event};
 #[rustfmt::skip]
 use log::{debug, warn};
 
+const HOOKS: [&str; 3] = ["bprm_check_security", "file_open", "socket_connect"];
+
+/// Punto de entrada del agente en espacio de usuario.
+///
+/// Quita el límite de memoria bloqueada, carga el objeto eBPF, arranca el
+/// logger y el lector del ring buffer, adjunta el hook LSM de ejecución y
+/// espera a Ctrl-C.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -18,18 +25,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ebpf = load_ebpf()?;
     start_logger(&mut ebpf);
-    
-    let events_map = ebpf.take_map("EVENTS")
+
+    let events_map = ebpf
+        .take_map("EVENTS")
         .expect("No se encontró el mapa EVENTS");
 
     spawn_reader(events_map)?;
-    
-    let btf = aya::Btf::from_sys_fs()?;
-    let program: &mut aya::programs::Lsm = ebpf.program_mut("bprm_check_security").unwrap().try_into()?;
-    
-    program.load("bprm_check_security", &btf)?;
-    
-    program.attach()?;
+
+    attach(&mut ebpf, &HOOKS)?;
 
     let ctrl_c = tokio::signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
@@ -39,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Carga el binario eBPF `spark` embebido en tiempo de compilación (desde `OUT_DIR`).
 fn load_ebpf() -> Result<Ebpf, EbpfError> {
     let aya = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -48,25 +52,34 @@ fn load_ebpf() -> Result<Ebpf, EbpfError> {
     Ok(aya)
 }
 
-fn start_logger(mut ebpf: &mut Ebpf){
+/// Inicializa `aya_log` y lanza una tarea que vuelca los logs del programa eBPF.
+///
+/// Si el logger no se puede iniciar, solo emite un warning y sigue.
+fn start_logger(mut ebpf: &mut Ebpf) {
     match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => { warn!("failed to initialize eBPF logger: {e}"); }
+        Err(e) => {
+            warn!("failed to initialize eBPF logger: {e}");
+        }
         Ok(logger) => {
-            let logger_res = tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE);
-            if let Ok(mut logger) = logger_res{
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
+            let logger_res =
+                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE);
+            if let Ok(mut logger) = logger_res {
+                tokio::task::spawn(async move {
+                    loop {
+                        let mut guard = logger.readable_mut().await.unwrap();
+                        guard.get_inner_mut().flush();
+                        guard.clear_ready();
+                    }
+                });
             }
         }
     }
-
 }
 
+/// Lanza una tarea asíncrona que lee eventos del ring buffer `EVENTS`.
+///
+/// Por cada entrada hace `parse_event` + `Event::from_raw` e imprime el
+/// resultado o el error. La tarea termina si falla la espera de lectura.
 fn spawn_reader(events_map: aya::maps::Map) -> anyhow::Result<()> {
     let ring_buf = aya::maps::RingBuf::try_from(events_map)?;
     let mut async_events = tokio::io::unix::AsyncFd::new(ring_buf)?;
@@ -82,33 +95,47 @@ fn spawn_reader(events_map: aya::maps::Map) -> anyhow::Result<()> {
             };
 
             let ring_buf = guard.get_inner_mut();
-            
+
             while let Some(item) = ring_buf.next() {
                 let raw_bytes = item.as_ref();
                 println!("Evento recibido: {} bytes", raw_bytes.len());
                 let event = parse_event(&raw_bytes);
-                 match event {
+                match event {
                     Ok(e) => {
                         let clean_event = Event::from_raw(e);
-                        match clean_event  {
+                        match clean_event {
                             Ok(event) => {
-                                 println!("Evento parseado a {:#?}", event);
-                            },
+                                println!("Evento parseado a {:#?}", event);
+                            }
                             Err(err) => {
                                 println!("Evento fallado {:?}", err);
-                             } ,
+                            }
                         }
-                                           }
+                    }
                     Err(err) => {
                         println!("Evento fallado {:?}", err);
                     }
                 }
-
             }
 
             guard.clear_ready();
         }
     });
+
+    Ok(())
+}
+
+fn attach(ebpf: &mut Ebpf, hooks: &[&str]) -> anyhow::Result<()> {
+    let btf = aya::Btf::from_sys_fs()?;
+    for hook in hooks {
+        let program: &mut aya::programs::Lsm = ebpf
+            .program_mut(hook)
+            .unwrap_or_else(|| panic!("No se encontró el programa {}", hook))
+            .try_into()?;
+    
+        program.load(hook, &btf)?;
+        program.attach()?;
+    }
 
     Ok(())
 }

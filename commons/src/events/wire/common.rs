@@ -2,26 +2,26 @@ use core::fmt;
 
 use strum_macros::FromRepr;
 
-#[derive(Debug, PartialEq, Eq, FromRepr, Clone, Copy)]
-#[repr(u8)]
-pub enum FileOperation {
-    Open = 0,
-    Write = 1,
-    Read = 2,
-    Rename = 3,
-    Move = 4,
-    Link = 5,
-    Unlink = 6,
-}
+use super::{RawFilePayload, RawNetIPv4Payload, RawProcessPayload};
+use crate::events::wire::RawNetIPv6Payload;
 
+/// Discriminante del tipo de evento en el formato de cable.
+///
+/// Va en [`RawEventHeader::event_type`] y decide qué payload sigue a la
+/// cabecera y, por tanto, cuántos bytes ocupa.
 #[derive(Debug, PartialEq, FromRepr, Clone, Copy)]
 #[repr(u8)]
 pub enum EventKind {
     Process = 0,
     File = 1,
-    Net = 2,
+    NetIPv4 = 2,
+    NetIPv6 = 3,
 }
 
+/// Evento tal cual llega del ring buffer, ya troceado pero sin validar.
+///
+/// Contiene la cabecera, el payload según su tipo y, opcionalmente, un
+/// tail de bytes de longitud variable (p. ej. la ruta) que toma prestado del buffer original.
 #[derive(Copy, Clone, Debug)]
 pub struct RawEvent<'a> {
     pub header: RawEventHeader,
@@ -29,13 +29,21 @@ pub struct RawEvent<'a> {
     pub tail: Option<&'a [u8]>,
 }
 
+/// Payload crudo de un evento, una variante por cada [`EventKind`].
+///
+/// Lo usa el lado eBPF para escribir y el lado de usuario para leer.
 #[derive(Copy, Clone, Debug)]
 pub enum RawEventPayload {
     Process(RawProcessPayload),
     File(RawFilePayload),
-    Net(RawNetPayload),
+    NetIPv4(RawNetIPv4Payload),
+    NetIPv6(RawNetIPv6Payload),
 }
 
+/// Cabecera fija con la que empieza todo evento en el ring buffer.
+///
+/// `#[repr(C)]` para que kernel y usuario compartan el layout. `total_length`
+/// cuenta cabecera + payload + tail, y es lo que usa [`parse_event`] para delimitar el evento.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct RawEventHeader {
@@ -46,33 +54,10 @@ pub struct RawEventHeader {
     pub uid: u32,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct RawNetPayload {
-    pub origin_ip: u32,
-    pub target_ip: u32,
-    pub origin_port: u16,
-    pub target_port: u16,
-    pub protocol: u8,
-    pub result: u8,
-    pub direction: u8,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct RawProcessPayload {
-    pub process_id: u32,
-    pub ancestor_id: u32,
-    pub inode: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct RawFilePayload {
-    pub operation: u8,
-    pub inode: u64,
-}
-
+/// Errores al trocear un buffer de bytes con [`parse_event`].
+///
+/// Indican buffers truncados, un `total_length` incoherente o un tipo de
+/// evento desconocido.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseEventError {
     HeaderTruncated,
@@ -97,6 +82,11 @@ impl fmt::Display for ParseEventError {
     }
 }
 
+/// Interpreta un buffer de bytes del ring buffer como un [`RawEvent`].
+///
+/// Lee la cabecera, comprueba que `total_length` cabe en el buffer y es
+/// suficiente para el payload de su tipo, y separa payload y tail. No copia
+/// el tail: lo devuelve como slice prestado de `raw_bytes`.
 pub fn parse_event<'a>(raw_bytes: &'a [u8]) -> Result<RawEvent<'a>, ParseEventError> {
     let header_size = size_of::<RawEventHeader>();
 
@@ -116,7 +106,8 @@ pub fn parse_event<'a>(raw_bytes: &'a [u8]) -> Result<RawEvent<'a>, ParseEventEr
     let payload_size = match kind {
         EventKind::Process => size_of::<RawProcessPayload>(),
         EventKind::File => size_of::<RawFilePayload>(),
-        EventKind::Net => size_of::<RawNetPayload>(),
+        EventKind::NetIPv4 => size_of::<RawNetIPv4Payload>(),
+        EventKind::NetIPv6 => size_of::<RawNetIPv6Payload>(),
     };
 
     let tail_start = header_size + payload_size;
@@ -140,11 +131,17 @@ pub fn parse_event<'a>(raw_bytes: &'a [u8]) -> Result<RawEvent<'a>, ParseEventEr
             };
             RawEventPayload::File(p)
         }
-        EventKind::Net => {
+        EventKind::NetIPv4 => {
             let p = unsafe {
-                core::ptr::read_unaligned(payload_bytes.as_ptr() as *const RawNetPayload)
+                core::ptr::read_unaligned(payload_bytes.as_ptr() as *const RawNetIPv4Payload)
             };
-            RawEventPayload::Net(p)
+            RawEventPayload::NetIPv4(p)
+        }
+        EventKind::NetIPv6 => {
+            let p = unsafe {
+                core::ptr::read_unaligned(payload_bytes.as_ptr() as *const RawNetIPv6Payload)
+            };
+            RawEventPayload::NetIPv6(p)
         }
     };
 
@@ -162,6 +159,7 @@ pub fn parse_event<'a>(raw_bytes: &'a [u8]) -> Result<RawEvent<'a>, ParseEventEr
     })
 }
 
+// NOTA: tests generados/asistidos por IA (Claude)
 #[cfg(test)]
 mod tests {
     use core::mem::size_of;
@@ -229,15 +227,15 @@ mod tests {
         }
     }
 
-    fn default_net_payload(direction: u8) -> RawNetPayload {
-        RawNetPayload {
+    fn default_net_payload(operation: u8) -> RawNetIPv4Payload {
+        RawNetIPv4Payload {
             origin_ip: 0xC0A80001u32.to_be(),
             target_ip: 0x08080808u32.to_be(),
             origin_port: 443u16.to_be(),
             target_port: 54321u16.to_be(),
             protocol: 6,
+            operation,
             result: 0,
-            direction,
         }
     }
 
@@ -250,7 +248,11 @@ mod tests {
             "Process payload ABI mismatch"
         );
         assert_eq!(size_of::<RawFilePayload>(), 16, "File payload ABI mismatch");
-        assert_eq!(size_of::<RawNetPayload>(), 16, "Net payload ABI mismatch");
+        assert_eq!(
+            size_of::<RawNetIPv4Payload>(),
+            16,
+            "Net IPv4 payload ABI mismatch"
+        );
     }
 
     #[test]
@@ -342,33 +344,39 @@ mod tests {
     }
 
     #[test]
-    fn test_ok_net() {
-        let header_0 = default_header(EventKind::Net);
+    fn test_ok_net_ipv4() {
+        let header_0 = default_header(EventKind::NetIPv4);
         let payload_0 = default_net_payload(0);
         let mut buf_0 = [0u8; 256];
         let len_0 = build_raw_buffer(header_0, &payload_0, None, None, &mut buf_0);
 
         let event_0 = parse_event(&buf_0[..len_0]).expect("Net parse failed");
-        if let RawEventPayload::Net(p) = event_0.payload {
+        assert!(event_0.tail.is_none());
+        if let RawEventPayload::NetIPv4(p) = event_0.payload {
             assert_eq!(
-                p.direction, 0,
-                "Direction no sobrevivió el round-trip como 0"
+                p.operation, 0,
+                "Operation no sobrevivió el round-trip como 0"
             );
+            assert_eq!(p.origin_ip, 0xC0A80001u32.to_be());
+            assert_eq!(p.target_ip, 0x08080808u32.to_be());
+            assert_eq!(p.origin_port, 443u16.to_be());
             assert_eq!(p.target_port, 54321u16.to_be());
+            assert_eq!(p.protocol, 6);
+            assert_eq!(p.result, 0);
         } else {
             panic!("Parsed wrong payload type");
         }
 
-        let header_1 = default_header(EventKind::Net);
+        let header_1 = default_header(EventKind::NetIPv4);
         let payload_1 = default_net_payload(1);
         let mut buf_1 = [0u8; 256];
         let len_1 = build_raw_buffer(header_1, &payload_1, None, None, &mut buf_1);
 
         let event_1 = parse_event(&buf_1[..len_1]).expect("Net parse failed");
-        if let RawEventPayload::Net(p) = event_1.payload {
+        if let RawEventPayload::NetIPv4(p) = event_1.payload {
             assert_eq!(
-                p.direction, 1,
-                "Direction no sobrevivió el round-trip como 1"
+                p.operation, 1,
+                "Operation no sobrevivió el round-trip como 1"
             );
         } else {
             panic!("Parsed wrong payload type");
